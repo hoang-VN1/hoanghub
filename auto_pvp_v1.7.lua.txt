@@ -1,0 +1,516 @@
+-- auto pvp helper v1.7 (v1.6 + skip respawn protection)
+-- bypass tp -> target -> fast m1 -> low hp escape -> regen back -> next target -> hop server
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local TS = game:GetService("TeleportService")
+local HS = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local VIM = game:GetService("VirtualInputManager")
+local ColSvc = game:GetService("CollectionService")
+
+local lp = Players.LocalPlayer
+local CommF = RS.Remotes:WaitForChild("CommF_")
+
+-- ==== config ====
+local cfg = {
+	escapeHP = 3000,
+	resumeHP = 10000,
+	atkRange = 12,
+	bypassTP = true,
+	flyUpSpeed = 350,
+	hopOnEmpty = true,
+	flyUpHeight = 10000,
+	autoV4 = true,
+	autoHaki = true,
+	autoPvP = true,
+	skipSafeZone = true,
+	skipPvPOff = true,
+	skipFF = true,
+	skipRespawn = true,        -- THÊM: skip player vừa respawn
+	respawnCooldown = 10,      -- nhớ 10s sau khi player chết, không dí
+}
+
+local state = {
+	target = nil,
+	lastTarget = nil,
+	lastTargetPos = nil,
+	escaping = false,
+	flying = false,
+	bodyVel = nil,
+	lastV4 = 0,
+	lastHaki = 0,
+	lastPvP = 0,
+	triedServers = {},
+	hopping = false,
+	deadAt = {},               -- THÊM: lưu thời điểm chết của từng player
+}
+
+-- ==== helpers ====
+local function char() return lp.Character end
+local function hrp() local c=char() return c and c:FindFirstChild("HumanoidRootPart") end
+local function hum() local c=char() return c and c:FindFirstChildOfClass("Humanoid") end
+local function alive(plr)
+	if not plr or not plr.Character then return false end
+	local h = plr.Character:FindFirstChildOfClass("Humanoid")
+	return h and h.Health > 0
+end
+local function dist(p1, p2) return (p1 - p2).Magnitude end
+
+local req = http_request or request or (syn and syn.request) or (fluxus and fluxus.request)
+local function httpGet(url)
+	if req then
+		local ok, res = pcall(req, {Url=url, Method="GET"})
+		if ok and res and res.Body then return res.Body end
+	end
+	local ok, body = pcall(function() return game:HttpGet(url) end)
+	if ok then return body end
+end
+
+-- ==== THÊM: track death của mọi player ====
+-- Khi player chết -> ghi thời điểm. Player respawn trong 10s -> skip
+local function watchPlayer(plr)
+	plr.CharacterAdded:Connect(function(c)
+		-- character mới spawn -> nhớ thời điểm
+		state.deadAt[plr.Name] = tick()
+		-- bắt event chết
+		local h = c:WaitForChild("Humanoid", 5)
+		if h then
+			h.Died:Connect(function()
+				state.deadAt[plr.Name] = tick()
+			end)
+		end
+	end)
+	-- bắt cho character hiện tại
+	if plr.Character then
+		local h = plr.Character:FindFirstChildOfClass("Humanoid")
+		if h then
+			h.Died:Connect(function()
+				state.deadAt[plr.Name] = tick()
+			end)
+		end
+	end
+end
+
+for _,p in ipairs(Players:GetPlayers()) do
+	if p ~= lp then watchPlayer(p) end
+end
+Players.PlayerAdded:Connect(function(p)
+	if p ~= lp then watchPlayer(p) end
+end)
+Players.PlayerRemoving:Connect(function(p)
+	state.deadAt[p.Name] = nil
+end)
+
+-- check player có đang respawn protection không
+local function isRespawning(p)
+	local t = state.deadAt[p.Name]
+	if not t then return false end
+	return (tick() - t) < cfg.respawnCooldown
+end
+
+-- ==== inArea + safezone + FF + PvP check ====
+local function inArea(pos)
+	local loc = workspace:FindFirstChild("_WorldOrigin")
+	loc = loc and loc:FindFirstChild("Locations")
+	if not loc then return {Name=""} end
+	for _,v in next, loc:GetChildren() do
+		if v:FindFirstChild("Mesh") and (pos - v.Position).Magnitude <= v.Mesh.Scale.X then
+			return v
+		end
+	end
+	return {Name=""}
+end
+
+local SAFE_ZONES = {"PirateVillage","MarineStart","MiddleTown","JungleTown","Desert","FrozenVillage","SkyIsland","Marineford","ColosseumStart","PiratePort","Cafe","Graveyard","SnowMountain"}
+local function isSafe(part)
+	local a = inArea(part.Position)
+	if a.Name == "" then return false end
+	for _,sn in ipairs(SAFE_ZONES) do
+		if a.Name:find(sn) then return true end
+	end
+	return false
+end
+local function hasFF(p)
+	return p.Character and p.Character:FindFirstChildOfClass("ForceField") ~= nil
+end
+local function isPlayerPvP(p)
+	if not p.Character then return false end
+	local ok, tag = pcall(function() return ColSvc:HasTag(p.Character, "Active") end)
+	if ok and tag then return true end
+	local d = p:FindFirstChild("Data")
+	if d and d:FindFirstChild("PVP") then return d.PVP.Value == true end
+	if p.Team == nil then return false end
+	return true
+end
+
+-- check tổng hợp dùng cho cả findTarget và fast M1
+local function isValidEnemy(plr, hPart)
+	if cfg.skipSafeZone and isSafe(hPart) then return false end
+	if cfg.skipFF and hasFF(plr) then return false end
+	if cfg.skipPvPOff and not isPlayerPvP(plr) then return false end
+	if cfg.skipRespawn and isRespawning(plr) then return false end
+	return true
+end
+
+-- ==== bypass teleport ====
+local function spawnOf(part)
+	local sp = workspace._WorldOrigin.PlayerSpawns.Pirates
+	for _,v in next, sp:GetChildren() do
+		if (v.Part.Position - part.Position).Magnitude <= 2500 then
+			return v
+		end
+	end
+end
+
+local function getBypassPoint(targetPart)
+	local me = hrp()
+	if not me then return end
+	local best, bestDist
+	local sp = workspace._WorldOrigin.PlayerSpawns.Pirates
+	for _,v in next, sp:GetChildren() do
+		if (targetPart.Position - me.Position).Magnitude >= 3000
+		and spawnOf(v.Part) ~= spawnOf(me)
+		and (v.Part.Position - me.Position).Magnitude <= 10000 then
+			local d = (v.Part.Position - targetPart.Position).Magnitude
+			if not bestDist or d < bestDist then
+				bestDist = d
+				best = v
+			end
+		end
+	end
+	return best
+end
+
+local function canBypass(targetPart)
+	if not cfg.bypassTP then return false end
+	local a = inArea(targetPart.Position).Name
+	if a == "" then return false end
+	if a:find("Dimension") or a:find("Submerged") or a:lower():find("under") or a == "Sealed Cavern" then
+		return false
+	end
+	local me = hrp()
+	if me and dist(me.Position, targetPart.Position) <= 3500 then return false end
+	return true
+end
+
+local function bypassTP(targetPart)
+	local c = char()
+	if not c or not hum() or hum().Health <= 0 then return end
+	if not canBypass(targetPart) then return false end
+	local sp = getBypassPoint(targetPart)
+	if not sp then return false end
+
+	pcall(function()
+		c.LastSpawnPoint.Disabled = true
+		CommF:InvokeServer("SetLastSpawnPoint", sp.Name)
+		CommF:InvokeServer("SetSpawnPoint")
+		c:PivotTo(sp.Part.CFrame)
+		hum():ChangeState(15)
+	end)
+	repeat task.wait() until char() and hum() and hum().Health > 0
+	return true
+end
+
+-- ==== tp đến player ====
+local function tpTo(part, offset)
+	local c = char()
+	local me = hrp()
+	if not c or not me then return end
+	offset = offset or Vector3.new(0, 2, -3)
+	if dist(me.Position, part.Position) > 3500 then
+		bypassTP(part)
+		task.wait(0.2)
+	end
+	me = hrp()
+	if me then
+		me.CFrame = part.CFrame * CFrame.new(offset)
+	end
+end
+
+-- ==== bay lên trời ====
+local function flyUp()
+	if state.flying then return end
+	state.flying = true
+	local me = hrp()
+	if not me then return end
+	local startY = me.Position.Y
+
+	if state.target and state.target.Character then
+		local th = state.target.Character:FindFirstChild("HumanoidRootPart")
+		if th then state.lastTarget = state.target; state.lastTargetPos = th.Position end
+	end
+
+	local bv = Instance.new("BodyVelocity")
+	bv.MaxForce = Vector3.new(0, math.huge, 0)
+	bv.Velocity = Vector3.new(0, cfg.flyUpSpeed, 0)
+	bv.Name = "_pvpFly"
+	bv.Parent = me
+	state.bodyVel = bv
+
+	task.spawn(function()
+		while state.flying do
+			local h = hum()
+			local m = hrp()
+			if h then h.PlatformStand = true end
+			if m and state.bodyVel and (m.Position.Y - startY) >= cfg.flyUpHeight then
+				state.bodyVel.Velocity = Vector3.new(0, 0, 0)
+			end
+			task.wait(0.1)
+		end
+	end)
+end
+
+local function stopFly()
+	state.flying = false
+	if state.bodyVel then
+		state.bodyVel:Destroy()
+		state.bodyVel = nil
+	end
+	local h = hum()
+	if h then h.PlatformStand = false end
+end
+
+local function diveBack()
+	if not state.lastTarget and not state.lastTargetPos then return end
+	local goTo
+	if state.lastTarget and alive(state.lastTarget) then
+		goTo = state.lastTarget.Character.HumanoidRootPart.Position
+	else
+		goTo = state.lastTargetPos
+	end
+	local me = hrp()
+	if not me then return end
+	me.CFrame = CFrame.new(goTo + Vector3.new(0, 5, -3))
+end
+
+-- ==== V4 + HAKI + PVP ====
+local function isPvPOn()
+	local d = lp:FindFirstChild("Data")
+	if d and d:FindFirstChild("PVP") then return d.PVP.Value == true end
+	return true
+end
+local function enablePvP()
+	if not cfg.autoPvP or tick()-state.lastPvP < 2 then return end
+	state.lastPvP = tick()
+	if isPvPOn() then return end
+	for _,a in ipairs({"TogglePVP","SetPVP","EnablePVP"}) do
+		pcall(function() CommF:InvokeServer(a, true) end)
+		task.wait(0.1)
+		if isPvPOn() then return end
+	end
+end
+
+local function getFury()
+	local ok, v = pcall(function()
+		local g = lp:FindFirstChild("PlayerGui")
+		local m = g and g:FindFirstChild("Main")
+		local f = m and m:FindFirstChild("Fury")
+		if f and f:FindFirstChild("Amount") then
+			return tonumber(string.match(f.Amount.Text or "0", "(%d+)")) or 0
+		end
+		return 0
+	end)
+	return (ok and v) or 0
+end
+local function isV4()
+	local c = char(); if not c then return false end
+	if c:GetAttribute("V4") or c:GetAttribute("Awakened") then return true end
+	for _,n in ipairs({"V4Particles","RaceV4","AwakenEffect"}) do
+		if c:FindFirstChild(n) then return true end
+	end
+	return false
+end
+local function activateV4()
+	if not cfg.autoV4 or tick()-state.lastV4 < 3 then return end
+	if isV4() or getFury() < 100 then return end
+	state.lastV4 = tick()
+	for _,arg in ipairs({"Awaken","ActivateRaceV4","RaceAwakening"}) do
+		pcall(function() CommF:InvokeServer(arg) end)
+		task.wait(0.1)
+		if isV4() then return end
+	end
+end
+local function isHaki()
+	local c = char(); if not c then return false end
+	local be = c:FindFirstChild("BodyEffects")
+	if be and be:FindFirstChild("Color") and be.Color.Value == Color3.new(0,0,0) then return true end
+	return c:GetAttribute("Buso") == true
+end
+local function toggleHaki()
+	if not cfg.autoHaki or tick()-state.lastHaki < 4 then return end
+	if isHaki() or not state.target then return end
+	state.lastHaki = tick()
+	pcall(function() CommF:InvokeServer("Buso") end)
+end
+
+-- ==== findTarget ====
+local function findTarget()
+	local me = hrp()
+	if not me then return end
+	local best, bestD
+	for _,p in ipairs(Players:GetPlayers()) do
+		if p ~= lp and alive(p) then
+			local hp = p.Character.HumanoidRootPart
+			if isValidEnemy(p, hp) then
+				local d = dist(me.Position, hp.Position)
+				if not bestD or d < bestD then
+					bestD = d; best = p
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function equipFist()
+	local c = char()
+	if not c then return end
+	if c:FindFirstChildOfClass("Tool") then return end
+	for _,t in ipairs(lp.Backpack:GetChildren()) do
+		if t:IsA("Tool") and t:FindFirstChild("LeftClickRemote") then
+			hum():EquipTool(t)
+			return
+		end
+	end
+end
+
+-- ==== FAST M1 ====
+_G.M1BF = true
+task.spawn(function()
+	while task.wait() do
+		if not _G.M1BF then continue end
+		local c = char()
+		if not c then continue end
+		local t = c:FindFirstChildOfClass("Tool")
+		local r = c:FindFirstChild("HumanoidRootPart")
+		if t and t:FindFirstChild("LeftClickRemote") and r then
+			for _,plr in ipairs(Players:GetPlayers()) do
+				if plr ~= lp and plr.Character then
+					local h = plr.Character:FindFirstChild("HumanoidRootPart")
+					local m = plr.Character:FindFirstChild("Humanoid")
+					if h and m and m.Health > 0 and dist(h.Position, r.Position) <= 90 then
+						if isValidEnemy(plr, h) then
+							t.LeftClickRemote:FireServer((h.Position - r.Position).Unit, 1)
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+-- ==== hop server liên tục ====
+local function hopServer()
+	if state.hopping then return end
+	state.hopping = true
+	local attempts = 0
+	while attempts < 999 do
+		attempts = attempts + 1
+		local servers = {}
+		local cursor = ""
+		for _=1, 5 do
+			local ok, res = pcall(function()
+				local url = "https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"
+				if cursor ~= "" then url = url.."&cursor="..cursor end
+				return HS:JSONDecode(httpGet(url))
+			end)
+			if not ok or not res then break end
+			for _,s in ipairs(res.data or {}) do
+				if s.playing and s.playing < s.maxPlayers and s.id ~= game.JobId
+				and not state.triedServers[s.id] then
+					table.insert(servers, s.id)
+				end
+			end
+			if not res.nextPageCursor then break end
+			cursor = res.nextPageCursor
+		end
+		if #servers == 0 then
+			state.triedServers = {}
+			task.wait(1)
+		else
+			local pick = servers[math.random(1, #servers)]
+			state.triedServers[pick] = true
+			local oldJob = game.JobId
+			pcall(function() TS:TeleportToPlaceInstance(game.PlaceId, pick, lp) end)
+			task.wait(3)
+			if game.JobId ~= oldJob then
+				state.hopping = false
+				return
+			end
+		end
+		task.wait(0.3)
+	end
+	state.hopping = false
+end
+
+-- ==== loop V4 + Haki + PvP ====
+task.spawn(function()
+	while task.wait(0.5) do
+		local h = hum()
+		if h and h.Health > 0 then
+			pcall(enablePvP); pcall(activateV4); pcall(toggleHaki)
+		end
+	end
+end)
+
+-- ==== main loop ====
+task.spawn(function()
+	while task.wait(0.3) do
+		local c = char()
+		local h = hum()
+		local me = hrp()
+		if not (c and h and me and h.Health > 0) then continue end
+
+		if h.Health <= cfg.escapeHP and not state.escaping then
+			state.escaping = true
+			state.target = nil
+			flyUp()
+		end
+
+		if state.escaping then
+			if h.Health >= cfg.resumeHP then
+				stopFly()
+				state.escaping = false
+				diveBack()
+			end
+			continue
+		end
+
+		if not state.target or not alive(state.target) or not isValidEnemy(state.target, state.target.Character and state.target.Character:FindFirstChild("HumanoidRootPart") or me) then
+			local nt = findTarget()
+			if nt then
+				state.target = nt
+			else
+				if cfg.hopOnEmpty then
+					task.wait(2)
+					if not findTarget() then
+						hopServer()
+					end
+				end
+				continue
+			end
+		end
+
+		equipFist()
+		local tc = state.target.Character
+		local thrp = tc and tc:FindFirstChild("HumanoidRootPart")
+		if thrp then
+			local d = dist(me.Position, thrp.Position)
+			if d > cfg.atkRange then
+				tpTo(thrp)
+			end
+		end
+	end
+end)
+
+_G.AutoPVP = true
+print("[auto-pvp v1.7] loaded + skip respawn protection ("..cfg.respawnCooldown.."s)")
+
+_G.AutoPVP_Stop = function()
+	_G.M1BF = false
+	stopFly()
+	state.target = nil
+end
+_G.AutoPVP_Hop = hopServer
