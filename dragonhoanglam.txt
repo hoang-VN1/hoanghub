@@ -1,0 +1,388 @@
+local RS = game:GetService("ReplicatedStorage")
+local Run = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+
+local SceneControllerUtil = require(RS.Controllers.SceneController.SceneControllerUtil)
+local SkinUtil = require(RS.Modules.SkinUtil)
+local Effect = require(RS.Effect)
+local Sound = require(RS.Util.Sound)
+local Anims = require(RS.Util.Anims)
+
+local plr = Players.LocalPlayer
+local char = plr.Character or plr.CharacterAdded:Wait()
+local hum = char:WaitForChild("Humanoid")
+local hrp = char:WaitForChild("HumanoidRootPart")
+local cam = workspace.CurrentCamera
+local AnimUtil = require(game.ReplicatedStorage.Util)
+
+local flying = false
+local vel = 0
+local moveDir = Vector3.zero
+
+local rig = SceneControllerUtil.requestRig("WesternDragonRig")
+rig.Name = "WesternDragonRig"
+rig.Parent = workspace
+rig:ScaleTo(.05)
+rig:PivotTo(hrp.CFrame)
+
+SkinUtil.applySkin("Dragon (West)",{
+	[rig] = "Transformations.Dragon (West)-Dragon (West)"
+})
+
+local fakePlayer = SceneControllerUtil.newFakePlayer({
+	Character = char
+})
+
+for _,v in ipairs(char:GetDescendants()) do
+	if v:IsA("BasePart") then
+		v.Transparency = 1
+	elseif v:IsA("Decal") then
+		v.Transparency = 1
+	end
+end
+
+Effect.new("Dragon2.V"):play({
+	SizeMultiplier = .25,
+	player = fakePlayer,
+	hrp = hrp
+})
+
+task.spawn(function()
+	for i = .05,1,.05 do
+		rig:ScaleTo(i)
+		task.wait(.03)
+	end
+end)
+
+local anims = {
+	Idle = Anims:Get(rig,"WesternDragon_Idle"),
+	Walk = Anims:Get(rig,"WesternDragon_Walk"),
+	Jump = Anims:Get(rig,"WesternDragon_Jump"),
+	Fall = Anims:Get(rig,"WesternDragon_Fall"),
+
+	FlyIdle = Anims:Get(rig,"WesternDragon_Fly_Idle"),
+	FlyUp = Anims:Get(rig,"WesternDragon_Fly_JumpBoost"),
+	Flap = Anims:Get(rig,"WesternDragon_Fly_Flap"),
+	Glide = Anims:Get(rig,"WesternDragon_Fly_Glide"),
+	Dive = Anims:Get(rig,"WesternDragon_Fly_Dive"),
+	Boost = Anims:Get(rig,"WesternDragon_Fly_Boost"),
+	Stop = Anims:Get(rig,"WesternDragon_Fly_Stop"),
+	Land = Anims:Get(rig,"WesternDragon_Fly_Land"),
+	Left = Anims:Get(rig,"WesternDragon_Fly_Left2"),
+	Right = Anims:Get(rig,"WesternDragon_Fly_Right2"),
+	Tail = Anims:Get(rig,"WesternDragon_Fly_Tail2"),
+	Wind = Anims:Get(rig,"WesternDragon_Fly_Wind12")
+}
+
+for _,v in pairs(anims) do
+	v.Priority = Enum.AnimationPriority.Action4
+	v:AdjustSpeed(.85)
+end
+
+anims.Idle.Looped = true
+anims.Walk.Looped = true
+anims.FlyIdle.Looped = true
+anims.Glide.Looped = true
+anims.Tail.Looped = true
+anims.Wind.Looped = true
+
+local function stop(except)
+	for k,v in pairs(anims) do
+		if k ~= except and v.IsPlaying then
+			v:Stop(.2)
+		end
+	end
+end
+
+local function play(name,speed)
+	local a = anims[name]
+	if not a.IsPlaying then
+		stop(name)
+		a:Play(.2,1,speed or .85)
+	end
+end
+
+for _,v in pairs({
+	anims.FlyIdle,
+	anims.Flap,
+	anims.Boost
+}) do
+	v:GetMarkerReachedSignal("Wingflap"):Connect(function()
+		Sound:Play(
+			"BF_Dragon_WingFlaps_HeavyLarge_02_V2",
+			rig.PrimaryPart or rig:FindFirstChild("_BoundingBox"),
+			nil,
+			math.random(11,13)/10
+		)
+	end)
+end
+
+anims.Walk:GetMarkerReachedSignal("Footstep"):Connect(function()
+	Sound:Play(
+		"BF_WD_Western_Walking_Steps_01",
+		hrp
+	)
+end)
+
+play("Idle")
+
+local bv = Instance.new("BodyVelocity")
+bv.MaxForce = Vector3.zero
+bv.P = 90000
+bv.Parent = hrp
+
+local bg = Instance.new("BodyGyro")
+bg.MaxTorque = Vector3.zero
+bg.P = 18000
+bg.D = 800
+bg.Parent = hrp
+
+local function enableFly()
+	if flying then
+		return
+	end
+
+	flying = true
+
+	hum.PlatformStand = true
+	hum.AutoRotate = false
+
+	bv.MaxForce = Vector3.new(1,1,1) * 1e9
+	bg.MaxTorque = Vector3.new(1,1,1) * 1e9
+
+	play("FlyUp",.8)
+
+	Sound:Play(
+		"BF_WD_Western_Takeoff_01",
+		hrp
+	)
+
+	task.wait(.45)
+
+	anims.Wind:Play(.2,1,.8)
+	anims.Tail:Play(.2,1,.8)
+
+	vel = 90
+end
+
+local function disableFly()
+	if not flying then
+		return
+	end
+
+	flying = false
+
+	play("Land",.8)
+
+	bv.MaxForce = Vector3.zero
+	bg.MaxTorque = Vector3.zero
+	bv.Velocity = Vector3.zero
+
+	anims.Wind:Stop(.2)
+	anims.Tail:Stop(.2)
+
+	hum.PlatformStand = false
+	hum.AutoRotate = true
+
+	vel = 0
+
+	task.wait(.4)
+
+	play("Idle")
+end
+
+UIS.JumpRequest:Connect(function()
+	local state = hum:GetState()
+
+	if not flying and (
+		state == Enum.HumanoidStateType.Freefall or
+		state == Enum.HumanoidStateType.Jumping
+	) then
+		enableFly()
+	elseif flying then
+		disableFly()
+	end
+end)
+
+Run.RenderStepped:Connect(function(dt)
+	if not rig.Parent then
+		return
+	end
+
+local move = hum.MoveDirection
+local look = cam.CFrame.LookVector
+if move.Magnitude > 0 then
+	moveDir = Vector3.new(
+		look.X * move.Magnitude,
+		look.Y,
+		look.Z * move.Magnitude
+	).Unit
+else
+	moveDir = hrp.CFrame.LookVector
+end
+
+	if flying then
+		bg.CFrame = CFrame.lookAt(
+			hrp.Position,
+			hrp.Position + moveDir
+		)
+
+		if move.Magnitude > 0 then
+			vel = math.clamp(vel + 70 * dt,90,180)
+		else
+			vel = math.clamp(vel - 120 * dt,50,180)
+		end
+bv.Velocity = moveDir * vel
+		rig:PivotTo(
+			CFrame.lookAt(
+				hrp.Position + Vector3.new(0,3,0),
+				hrp.Position + moveDir * 100
+			)
+		)
+		local pitch = hrp.CFrame.LookVector.Y
+		if vel <= 70 then
+			play("FlyIdle",.75)
+		elseif pitch < -.4 then
+			play("Dive",.8)
+		elseif vel > 155 then
+			play("Boost",.9)
+		elseif vel > 120 then
+			play("Glide",.8)
+		else
+			play("Flap",.8)
+		end
+		local side = cam.CFrame.RightVector:Dot(move)
+
+		if side > .3 then
+			if not anims.Right.IsPlaying then
+				anims.Right:Play(.2,1,.8)
+			end
+			anims.Left:Stop(.2)
+
+		elseif side < -.3 then
+			if not anims.Left.IsPlaying then
+				anims.Left:Play(.2,1,.8)
+			end
+			anims.Right:Stop(.2)
+
+		else
+			anims.Left:Stop(.2)
+			anims.Right:Stop(.2)
+		end
+	else
+		rig:PivotTo(hrp.CFrame + Vector3.new(0,3,0))
+
+		local state = hum:GetState()
+
+		if state == Enum.HumanoidStateType.Freefall then
+			play("Fall",.8)
+
+		elseif state == Enum.HumanoidStateType.Jumping then
+			play("Jump",.8)
+
+		elseif move.Magnitude > 0 then
+			play("Walk",math.clamp(hrp.Velocity.Magnitude/18,.7,1.4))
+
+		else
+			play("Idle",.8)
+		end
+	end
+end)
+-- by trieu 1082 
+warn("by trieu")
+
+local tool = Instance.new("Tool")
+tool.Name = "Kitsune"
+tool.RequiresHandle = false
+tool.Parent = plr.Backpack
+
+local combo = 1
+local last = tick()
+
+local HIT_RANGE = 10
+local DAMAGE = 9999999
+
+local function HitMob(hrp)
+
+    for _,v in pairs(workspace:GetDescendants()) do
+        if v:IsA("Humanoid") and v ~= hum then
+
+            local root = v.Parent:FindFirstChild("HumanoidRootPart")
+            if root and (root.Position - hrp.Position).Magnitude <= HIT_RANGE then
+                v:TakeDamage(DAMAGE)
+            end
+
+        end
+    end
+
+end
+
+tool.Activated:Connect(function()
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    if tick() - last > 1 then
+        combo = 1
+    end
+
+    Effect.new("Kitsune.M1Combo"):replicate({
+        player = plr,
+        hrp = hrp,
+        index = combo,
+        playerOnGround = true,
+        transformed = false
+    })
+
+    hum.AutoRotate = false
+
+    local bg = Instance.new("BodyGyro")
+    bg.MaxTorque = Vector3.new(0,400000,0)
+    bg.P = 100000
+    bg.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + hrp.CFrame.LookVector)
+    bg.Parent = hrp
+
+    game.Debris:AddItem(bg,0.3)
+
+    task.delay(0.3,function()
+        hum.AutoRotate = true
+    end)
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Velocity = hrp.CFrame.LookVector * 80
+    bv.MaxForce = Vector3.new(100000,0,100000)
+    bv.Parent = hrp
+
+    game.Debris:AddItem(bv,0.3)
+
+    local animName = "CharKitsuneM1_" .. combo
+    local animTrack = AnimUtil.Anims:Get(char, animName)
+    if animTrack then
+        animTrack:Play()
+    end
+
+    task.delay(0.15,function()
+        HitMob(hrp)
+    end)
+
+    local cam = workspace.CurrentCamera
+    task.spawn(function()
+        for i=1,6 do
+            cam.CFrame = cam.CFrame * CFrame.new(
+                math.random(-1,1)/25,
+                math.random(-1,1)/25,
+                0
+            )
+            task.wait()
+        end
+    end)
+
+    combo += 1
+    if combo > 5 then
+        combo = 1
+    end
+
+    last = tick()
+
+end)
